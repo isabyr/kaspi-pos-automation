@@ -26,16 +26,15 @@ const getSession = () => {
 
 const sessionHeaders = () => {
   const s = getSession();
-  const h = {};
-  if (s.tokenSN) h['X-Token-SN'] = s.tokenSN;
-  if (s.profileId) h['X-Profile-ID'] = String(s.profileId);
-  if (s.vtokenSecret) h['X-Vtoken-Secret'] = s.vtokenSecret;
-  return h;
+  return s.credentials ? { 'X-Kaspi-Credentials': s.credentials } : {};
 };
 
 const apiFetch = async (path, opts = {}) => {
   opts.headers = { ...sessionHeaders(), ...(opts.headers || {}) };
   const resp = await fetch(API + path, opts);
+  // Ключ шифрования конвертов ротирован — сервер вернул перевыпущенный конверт.
+  const refreshed = resp.headers.get('X-Kaspi-Credentials-Refresh');
+  if (refreshed) saveSession({ credentials: refreshed });
   return resp.json();
 };
 
@@ -74,7 +73,7 @@ const checkSession = async () => {
 
 const tryRestoreSession = async () => {
   const session = getSession();
-  if (session.tokenSN && session.vtokenSecret) {
+  if (session.credentials) {
     showMainScreen(session);
     // Verify session is still active on the server
     const result = await checkSession();
@@ -144,7 +143,7 @@ const resetAuth = () => {
 
 // ─── Auth Flow ───
 
-let authProcessId = null;
+let onboardingState = null;
 
 const sendPhone = async () => {
   const phone = digitsOnly($('phoneInput').value);
@@ -162,9 +161,10 @@ const sendPhone = async () => {
       return;
     }
 
-    authProcessId = init.processId;
+    onboardingState = init.onboardingState;
 
-    const resp = await apiPost('/api/auth/send-phone', { phoneNumber: phone, processId: authProcessId });
+    const resp = await apiPost('/api/auth/send-phone', { phoneNumber: phone, onboardingState });
+    if (resp.onboardingState) onboardingState = resp.onboardingState;
     if (resp.success) {
       $('otpDesc').textContent = resp.desc || `SMS отправлен на +7${phone}`;
       setAuthStep(2);
@@ -189,12 +189,14 @@ const verifyOtp = async () => {
   showAuthMsg('', '');
 
   try {
-    const resp = await apiPost('/api/auth/verify-otp', { otp, processId: authProcessId });
+    const resp = await apiPost('/api/auth/verify-otp', { otp, onboardingState });
     if (resp.success && resp.step === 'finished') {
-      saveSession(resp);
-      authProcessId = null;
+      // На сервере ничего не остаётся — конверт и есть вся сессия мерчанта.
+      saveSession({ credentials: resp.credentials, phone: resp.phone, orgName: resp.orgName });
+      onboardingState = null;
       showMainScreen(resp);
     } else {
+      if (resp.onboardingState) onboardingState = resp.onboardingState;
       showAuthMsg(`Неверный код или ошибка: ${resp.body?.data?.desc || JSON.stringify(resp.body)}`, 'err');
     }
   } catch (e) {
@@ -218,9 +220,11 @@ const showMainScreen = (data) => {
 };
 
 const logout = async () => {
-  const { tokenSN } = getSession();
+  const { credentials } = getSession();
   clearSession();
-  await apiPost('/api/auth/logout', { tokenSN });
+  if (credentials) {
+    await apiFetch('/api/auth/logout', { method: 'POST', headers: { 'X-Kaspi-Credentials': credentials } });
+  }
   $('mainScreen').classList.add('hidden');
   $('authScreen').classList.remove('hidden');
   $('phoneInput').value = '';
@@ -726,7 +730,7 @@ Object.assign(window, {
 (() => {
   setAuthStep(1);
   const session = getSession();
-  if (session.tokenSN && session.vtokenSecret) {
+  if (session.credentials) {
     showMainScreen(session);
   }
 })();

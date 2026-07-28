@@ -1,27 +1,75 @@
 import { Router } from 'express';
-import { DEVICE, APP, UA_NATIVE, ENTRANCE_HEADERS_BASE, KASPI_ENTRANCE_URL, KASPI_MTOKEN_URL } from '../config.js';
+import { APP, UA_NATIVE, ENTRANCE_HEADERS_BASE, KASPI_ENTRANCE_URL, KASPI_MTOKEN_URL } from '../config.js';
 import { createEmptySession, applyOrgContext } from '../session.js';
 import {
-  generateECDH,
-  completeECDH,
+  generateEcdhKeyPair,
+  ecdhPublicKeyB64,
+  deriveSharedSecret,
   computeTokenSnMac,
-  signDataPayload,
   computeXSU,
-  computeXSign,
-  encryptSecret,
 } from '../crypto.js';
+import { createDeviceIdentity } from '../device.js';
+import { buildDevice } from '../device.js';
+import { createSigner } from '../signer.js';
+import { sealCredentials, sealOnboarding, unsealOnboarding } from '../envelope.js';
+import { contextFromRequest } from '../middleware/credentials.js';
 import { loggedFetch, extractUserToken, entranceCookie, generateUUID, nowISO } from '../helpers.js';
+import { dropPaymentsFor } from '../polling.js';
 
 const router = Router();
 
-// In-flight auth sessions keyed by processId (temporary, cleared after finish)
-const authSessions = new Map();
+// ─── Onboarding state ───
+//
+// Сервер не хранит незавершённые входы. Всё состояние трёхшагового входа
+// (processId, user_token, только что созданное устройство) едет к клиенту в
+// зашифрованном onboardingState и возвращается на следующем шаге.
+
+const onboardingContext = (state) => ({
+  device: state.device,
+  app: state.app,
+  signer: state.signer,
+});
+
+const readOnboarding = (req, res) => {
+  const raw = req.body?.onboardingState;
+  if (!raw) {
+    res.status(400).json({ error: 'onboardingState required (from /api/auth/init)', code: 'missing_onboarding_state' });
+    return null;
+  }
+  try {
+    return unsealOnboarding(raw);
+  } catch (err) {
+    res.status(400).json({ error: err.message, code: err.code || 'invalid_onboarding_state' });
+    return null;
+  }
+};
 
 // ═══════════════════════════════════════════════════
 //  Step 1 — Init entrance (get processId)
 // ═══════════════════════════════════════════════════
 
 router.post('/init', async (req, res) => {
+  // Повторный вход должен использовать УЖЕ существующее устройство мерчанта:
+  // регистрация нового устройства на тот же номер вытесняет живую сессию Kaspi.
+  let storedDevice;
+  if (req.headers['x-kaspi-credentials']) {
+    try {
+      const existing = contextFromRequest(req, res);
+      storedDevice = {
+        deviceId: existing.device.deviceId,
+        installId: existing.device.installId,
+        pinHash: existing.device.pinHash,
+        privateKey: existing.device.privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64'),
+      };
+    } catch (err) {
+      return res.status(401).json({ error: err.message, code: err.code || 'invalid_credentials' });
+    }
+  } else {
+    storedDevice = createDeviceIdentity();
+  }
+
+  const device = buildDevice(storedDevice);
+  const ctx = { device, app: { ...APP }, signer: createSigner(device.privateKey) };
   const session = createEmptySession();
 
   try {
@@ -29,8 +77,8 @@ router.post('/init', async (req, res) => {
       method: 'POST',
       headers: {
         ...ENTRANCE_HEADERS_BASE,
-        Referer: `${KASPI_ENTRANCE_URL}/process/entrance/?auth=2&appBuild=${APP.build}&appVersion=${APP.version}&platformVersion=${APP.platformVer}&platformType=IOS&deviceBrand=${APP.brand}&deviceModel=${APP.model}&deviceId=${DEVICE.deviceId}&installId=${DEVICE.installId}&frontCameraAvailable=true&sf=registration&pc=KPEntrance&noPass=0`,
-        Cookie: entranceCookie(),
+        Referer: `${KASPI_ENTRANCE_URL}/process/entrance/?auth=2&appBuild=${APP.build}&appVersion=${APP.version}&platformVersion=${APP.platformVer}&platformType=IOS&deviceBrand=${APP.brand}&deviceModel=${APP.model}&deviceId=${device.deviceId}&installId=${device.installId}&frontCameraAvailable=true&sf=registration&pc=KPEntrance&noPass=0`,
+        Cookie: entranceCookie(ctx),
       },
       body: JSON.stringify({
         data: {},
@@ -42,8 +90,8 @@ router.post('/init', async (req, res) => {
           platformType: 'IOS',
           deviceBrand: APP.brand,
           deviceModel: APP.model,
-          deviceId: DEVICE.deviceId,
-          installId: DEVICE.installId,
+          deviceId: device.deviceId,
+          installId: device.installId,
           frontCameraAvailable: 'true',
           sf: 'registration',
           pc: 'KPEntrance',
@@ -57,12 +105,22 @@ router.post('/init', async (req, res) => {
     if (ut) session.userToken = ut;
 
     const body = await resp.json();
-    if (body.meta?.pId) {
-      session.processId = body.meta.pId;
-      authSessions.set(session.processId, session);
-    }
+    if (body.meta?.pId) session.processId = body.meta.pId;
 
-    res.json({ success: !!session.processId, processId: session.processId, view: body.view?.code, body });
+    res.json({
+      success: !!session.processId,
+      processId: session.processId,
+      reusedDevice: !!req.headers['x-kaspi-credentials'],
+      onboardingState: session.processId
+        ? sealOnboarding({
+            processId: session.processId,
+            userToken: session.userToken,
+            device: storedDevice,
+          })
+        : null,
+      view: body.view?.code,
+      body,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -73,37 +131,46 @@ router.post('/init', async (req, res) => {
 // ═══════════════════════════════════════════════════
 
 router.post('/send-phone', async (req, res) => {
-  const { phoneNumber, processId } = req.body;
+  const { phoneNumber } = req.body;
   if (!phoneNumber) return res.status(400).json({ error: 'phoneNumber required (e.g. 7XXXXXXXXX)' });
-  if (!processId) return res.status(400).json({ error: 'processId required (from /api/auth/init)' });
 
-  const session = authSessions.get(processId);
-  if (!session) return res.status(400).json({ error: 'Unknown processId. Call /api/auth/init first' });
-
-  session.phoneNumber = phoneNumber;
+  const state = readOnboarding(req, res);
+  if (!state) return;
 
   try {
     const resp = await loggedFetch(`${KASPI_ENTRANCE_URL}/api/v1/entrance/step`, {
       method: 'POST',
       headers: {
         ...ENTRANCE_HEADERS_BASE,
-        Referer: `${KASPI_ENTRANCE_URL}/process/universal-enter-phone-number?pId=${session.processId}&firstPage=KPUniversalEnterPhoneNumber`,
-        Cookie: entranceCookie(session.userToken),
+        Referer: `${KASPI_ENTRANCE_URL}/process/universal-enter-phone-number?pId=${state.processId}&firstPage=KPUniversalEnterPhoneNumber`,
+        Cookie: entranceCookie(onboardingContext(state), state.userToken),
       },
       body: JSON.stringify({
-        meta: { pId: session.processId, sn: 'EnterPhoneNumber' },
+        meta: { pId: state.processId, sn: 'EnterPhoneNumber' },
         data: { phoneNumber },
         actType: 'Success',
       }),
     });
 
     const ut = extractUserToken(resp);
-    if (ut) session.userToken = ut;
-
     const body = await resp.json();
     const smsSent = body.view?.code === 'EnterOtp';
 
-    res.json({ success: smsSent, processId: session.processId, desc: body.data?.desc, view: body.view?.code, body });
+    res.json({
+      success: smsSent,
+      processId: state.processId,
+      // user_token ротируется на каждом ответе — клиент обязан хранить свежий.
+      onboardingState: sealOnboarding({
+        processId: state.processId,
+        userToken: ut || state.userToken,
+        device: state.storedDevice,
+        phoneNumber,
+        iat: state.iat,
+      }),
+      desc: body.data?.desc,
+      view: body.view?.code,
+      body,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -114,47 +181,55 @@ router.post('/send-phone', async (req, res) => {
 // ═══════════════════════════════════════════════════
 
 router.post('/verify-otp', async (req, res) => {
-  const { otp, processId } = req.body;
+  const { otp } = req.body;
   if (!otp) return res.status(400).json({ error: 'otp required' });
-  if (!processId) return res.status(400).json({ error: 'processId required' });
 
-  const session = authSessions.get(processId);
-  if (!session) return res.status(400).json({ error: 'Unknown processId' });
+  const state = readOnboarding(req, res);
+  if (!state) return;
 
   try {
     const resp = await loggedFetch(`${KASPI_ENTRANCE_URL}/api/v1/entrance/step`, {
       method: 'POST',
       headers: {
         ...ENTRANCE_HEADERS_BASE,
-        Referer: `${KASPI_ENTRANCE_URL}/process/universal-enter-phone-number?pId=${session.processId}&firstPage=KPUniversalEnterPhoneNumber`,
-        Cookie: entranceCookie(session.userToken),
+        Referer: `${KASPI_ENTRANCE_URL}/process/universal-enter-phone-number?pId=${state.processId}&firstPage=KPUniversalEnterPhoneNumber`,
+        Cookie: entranceCookie(onboardingContext(state), state.userToken),
       },
       body: JSON.stringify({
-        meta: { pId: session.processId, sn: 'ViewEnterOtp' },
+        meta: { pId: state.processId, sn: 'ViewEnterOtp' },
         data: { userOtp: otp, inputType: 'auto' },
         actType: 'Success',
       }),
     });
 
     const ut = extractUserToken(resp);
-    if (ut) session.userToken = ut;
-
     const body = await resp.json();
 
     if (body.data?.type === 'kpDeviceRegistration' || body.view?.code === 'KPMobileCall') {
       // OTP verified — automatically call finish
-      const finishResult = await doFinish(session);
-      authSessions.delete(processId);
+      const finishResult = await doFinish(state);
       res.json({
         success: true,
-        processId: session.processId,
+        processId: state.processId,
         step: 'finished',
         message: 'OTP verified and finish completed',
         otpBody: body,
         ...finishResult,
       });
     } else {
-      res.json({ success: false, processId: session.processId, step: 'otp_response', body });
+      res.json({
+        success: false,
+        processId: state.processId,
+        step: 'otp_response',
+        onboardingState: sealOnboarding({
+          processId: state.processId,
+          userToken: ut || state.userToken,
+          device: state.storedDevice,
+          phoneNumber: state.phoneNumber,
+          iat: state.iat,
+        }),
+        body,
+      });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -162,15 +237,22 @@ router.post('/verify-otp', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
-//  Finish logic (shared by verify-otp and /finish)
+//  Finish logic — produces the credential envelope
 // ═══════════════════════════════════════════════════
 
-async function doFinish(session) {
-  const ecdhX509 = generateECDH();
-  console.log('Generated ECDH public key for guard.x509:', ecdhX509);
+async function doFinish(state) {
+  const { device, signer } = state;
+  const app = state.app;
+  const session = createEmptySession();
+  session.processId = state.processId;
+  session.phoneNumber = state.phoneNumber;
+
+  // Эфемерная пара ECDH живёт только внутри этого вызова.
+  const ecdhKeyPair = generateEcdhKeyPair();
+  const ecdhX509 = ecdhPublicKeyB64(ecdhKeyPair);
 
   const signedDataObj = {
-    installId: DEVICE.installId,
+    installId: device.installId,
     time: nowISO(),
     auth: [{ value: '', type: 'pincode' }],
     userIdHash: '',
@@ -186,23 +268,23 @@ async function doFinish(session) {
     'User-Agent': UA_NATIVE,
     'X-Time': nowISO(),
     'X-Call': 'notConnected',
-    'X-Platform-Type': APP.platform,
-    'X-PkTag': DEVICE.pkTag,
+    'X-Platform-Type': app.platform,
+    'X-PkTag': device.pkTag,
     'X-SU': computeXSU(finishUrl),
     'X-Net-Type': 'WIFI/ETHERNET',
     'X-Emulator': '0',
-    'X-Locale': APP.locale,
+    'X-Locale': app.locale,
     'X-SV': '2',
     'X-Request-ID': generateUUID(),
     'X-Time-Zone': 'GMT+05:00',
     'X-SH': 'url,X-Time-Zone,X-Request-ID,X-Net-Type,X-Emulator,X-Call,X-Platform-Type,X-Locale,X-Time,X-SV',
   };
   const finishBody = JSON.stringify({
-    signed: { sign: signDataPayload(signedDataB64), data: signedDataB64 },
-    guard: { pinHash: DEVICE.pinHash, x509: ecdhX509 },
-    processId: session.processId,
+    signed: { sign: signer.signData(signedDataB64), data: signedDataB64 },
+    guard: { pinHash: device.pinHash, x509: ecdhX509 },
+    processId: state.processId,
   });
-  finishHeaders['X-Sign'] = computeXSign(finishUrl, finishHeaders, finishHeaders['X-SH'], finishBody);
+  finishHeaders['X-Sign'] = signer.signRequest(finishUrl, finishHeaders, finishHeaders['X-SH'], finishBody);
 
   const resp = await loggedFetch(finishUrl, {
     method: 'POST',
@@ -212,107 +294,147 @@ async function doFinish(session) {
 
   const body = await resp.json();
 
-  if (body.success && body.data?.tokenSN) {
-    session.tokenSN = body.data.tokenSN;
+  if (!body.success || !body.data?.tokenSN) {
+    throw new Error('Finish failed: ' + JSON.stringify(body));
+  }
 
-    let vtokenSecret = null;
-    let rawSecret = null;
-    if (body.data.x509) {
-      try {
-        rawSecret = completeECDH(body.data.x509);
-        vtokenSecret = encryptSecret(rawSecret);
-        console.log('vtoken activated successfully');
-      } catch (e) {
-        console.error('ECDH key agreement failed:', e.message);
-      }
+  session.tokenSN = body.data.tokenSN;
+
+  let rawSecret = null;
+  if (body.data.x509) {
+    try {
+      rawSecret = deriveSharedSecret(ecdhKeyPair.privateKey, body.data.x509);
+      console.log('vtoken activated successfully');
+    } catch (e) {
+      console.error('ECDH key agreement failed:', e.message);
     }
+  }
 
-    // Fetch org context
-    const orgUrl = `${KASPI_MTOKEN_URL}/v08/organizations/org-context-otp`;
-    const piValue = session.profileId != null ? String(session.profileId) : '';
-    const orgHeaders = {
-      'Content-Type': 'application/json',
-      Accept: '*/*',
-      'Accept-Language': 'ru',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'User-Agent': UA_NATIVE,
-      'X-Kb-TokenSn': session.tokenSN,
-      'X-Kb-TokenSnMac': computeTokenSnMac(session.tokenSN, rawSecret),
-      'X-Install-ID': DEVICE.installId,
-      'X-App-Ver': APP.version,
-      'X-App-Bld': APP.build,
-      'X-Locale': APP.locale,
-      'X-Call': 'notConnected',
-      'X-Time': nowISO(),
-      'X-S': 'R:0|E:0|RH:0|N:0',
-      'X-SV': '2',
-      'X-Kb-Client-Ip': '192.168.1.96',
-      'X-PkTag': DEVICE.pkTag,
-      'X-SU': computeXSU(orgUrl),
-      'X-SH':
-        'url,X-Kb-Client-Ip,X-Time,X-App-Ver,X-SV,X-Locale,X-App-Bld,X-Install-ID,X-Kb-TokenSn,X-S,X-Kb-TokenSnMac,X-Call',
-      'X-Request-ID': generateUUID(),
-    };
-    const orgPayload = JSON.stringify({
-      DeviceInformation: {
-        SdkVersion: 'AOTP service',
-        DeviceId: DEVICE.deviceId,
-        ApplicationId: 'kz.kaspi.business',
-        ScreenWidth: APP.screenW,
-        Model: APP.model,
-        ScreenHeight: APP.screenH,
-        DeviceName: APP.deviceName,
-        VersionName: APP.version,
-        BuildRelease: `${APP.platform} ${APP.platformVer}`,
-        Brand: APP.brand,
-        Board: APP.platformVer,
-        Platform: APP.platform,
-        Product: 'Kaspi Pay',
-        frontCameraAvailable: true,
-        VersionCode: APP.build,
-        InstallId: DEVICE.installId,
-      },
-      OrganizationId: 0,
-    });
-    orgHeaders['X-Sign'] = computeXSign(orgUrl, orgHeaders, orgHeaders['X-SH'], orgPayload);
+  // Fetch org context
+  const orgUrl = `${KASPI_MTOKEN_URL}/v08/organizations/org-context-otp`;
+  const orgHeaders = {
+    'Content-Type': 'application/json',
+    Accept: '*/*',
+    'Accept-Language': 'ru',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'User-Agent': UA_NATIVE,
+    'X-Kb-TokenSn': session.tokenSN,
+    'X-Kb-TokenSnMac': computeTokenSnMac(session.tokenSN, rawSecret),
+    'X-Install-ID': device.installId,
+    'X-App-Ver': app.version,
+    'X-App-Bld': app.build,
+    'X-Locale': app.locale,
+    'X-Call': 'notConnected',
+    'X-Time': nowISO(),
+    'X-S': 'R:0|E:0|RH:0|N:0',
+    'X-SV': '2',
+    'X-Kb-Client-Ip': '192.168.1.96',
+    'X-PkTag': device.pkTag,
+    'X-SU': computeXSU(orgUrl),
+    'X-SH':
+      'url,X-Kb-Client-Ip,X-Time,X-App-Ver,X-SV,X-Locale,X-App-Bld,X-Install-ID,X-Kb-TokenSn,X-S,X-Kb-TokenSnMac,X-Call',
+    'X-Request-ID': generateUUID(),
+  };
+  const orgPayload = JSON.stringify({
+    DeviceInformation: {
+      SdkVersion: 'AOTP service',
+      DeviceId: device.deviceId,
+      ApplicationId: 'kz.kaspi.business',
+      ScreenWidth: app.screenW,
+      Model: app.model,
+      ScreenHeight: app.screenH,
+      DeviceName: app.deviceName,
+      VersionName: app.version,
+      BuildRelease: `${app.platform} ${app.platformVer}`,
+      Brand: app.brand,
+      Board: app.platformVer,
+      Platform: app.platform,
+      Product: 'Kaspi Pay',
+      frontCameraAvailable: true,
+      VersionCode: app.build,
+      InstallId: device.installId,
+    },
+    OrganizationId: 0,
+  });
+  orgHeaders['X-Sign'] = signer.signRequest(orgUrl, orgHeaders, orgHeaders['X-SH'], orgPayload);
 
-    const orgResp = await loggedFetch(orgUrl, {
-      method: 'POST',
-      headers: orgHeaders,
-      body: orgPayload,
-    });
+  const orgResp = await loggedFetch(orgUrl, {
+    method: 'POST',
+    headers: orgHeaders,
+    body: orgPayload,
+  });
 
-    const orgBody = await orgResp.json();
+  const orgBody = await orgResp.json();
 
-    if (orgBody.Data?.Current?.ProfileId) {
-      applyOrgContext(session, orgBody.Data);
-    }
+  if (orgBody.Data?.Current?.ProfileId) {
+    applyOrgContext(session, orgBody.Data);
+  }
 
-    return {
+  // tokenSN и общий секрет больше никогда не покидают сервер в открытом виде —
+  // они уезжают клиенту только внутри зашифрованного конверта.
+  const credentials = sealCredentials({
+    device: state.storedDevice,
+    session: {
       tokenSN: session.tokenSN,
-      vtokenSecret,
+      secret: rawSecret ? rawSecret.toString('base64') : null,
       profileId: session.profileId,
       organizationId: session.organizationId,
       orgName: session.orgName,
-      phone: session.phoneNumber,
-      organizations: orgBody.Data?.Organizations,
-    };
-  } else {
-    throw new Error('Finish failed: ' + JSON.stringify(body));
-  }
+      phoneNumber: session.phoneNumber,
+    },
+  });
+
+  return {
+    credentials,
+    authenticated: true,
+    deviceId: device.deviceId,
+    profileId: session.profileId,
+    organizationId: session.organizationId,
+    orgName: session.orgName,
+    phone: session.phoneNumber,
+    organizations: orgBody.Data?.Organizations,
+  };
 }
 
-// ─── Session status (client sends tokenSN) ───
+// ─── Envelope status (does not touch Kaspi — see GET /api/session/check for that) ───
 
-router.post('/session', (req, res) => {
-  const { tokenSN } = req.body || {};
-  res.json({ authenticated: !!tokenSN, tokenSN });
+router.get('/session', (req, res) => {
+  let ctx;
+  try {
+    ctx = contextFromRequest(req, res);
+  } catch (err) {
+    return res.status(401).json({ authenticated: false, error: err.message, code: err.code || 'invalid_credentials' });
+  }
+
+  res.json({
+    authenticated: !!(ctx.tokenSN && ctx.decryptedSecret),
+    deviceId: ctx.device.deviceId,
+    profileId: ctx.profileId,
+    organizationId: ctx.organizationId,
+    orgName: ctx.orgName,
+    phone: ctx.phoneNumber,
+    issuedAt: ctx.issuedAt,
+  });
 });
 
+router.post('/session', (req, res) =>
+  res.status(410).json({
+    error: 'POST /api/auth/session was removed in 2.0.0. Use GET /api/auth/session with X-Kaspi-Credentials.',
+    code: 'gone',
+  }),
+);
+
 // ─── Logout ───
+//
+// Хранить нечего — клиент просто выбрасывает конверт. Сервер лишь снимает с
+// опроса платежи этого мерчанта, чтобы они не висели до исчерпания попыток.
 
 router.post('/logout', (req, res) => {
-  res.json({ success: true });
+  let dropped = 0;
+  if (req.headers['x-kaspi-credentials']) {
+    dropped = dropPaymentsFor(req.headers['x-kaspi-credentials']);
+  }
+  res.json({ success: true, dropped });
 });
 
 export default router;

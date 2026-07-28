@@ -1,31 +1,32 @@
 import { Router } from 'express';
 import { KASPI_QRPAY_URL } from '../config.js';
 import { loggedFetch, signedQrPayHeaders } from '../helpers.js';
-import { decryptSecret } from '../crypto.js';
+import { contextFromRequest } from '../middleware/credentials.js';
 
 const router = Router();
-
-// Extract session from request headers
-const extractSession = (req) => ({
-  tokenSN: req.headers['x-token-sn'] || null,
-  profileId: req.headers['x-profile-id'] || null,
-  vtokenSecret: req.headers['x-vtoken-secret'] || null,
-});
 
 // ─── Check session validity ───
 
 router.get('/check', async (req, res) => {
-  const session = extractSession(req);
-
-  // 1. Check required headers
-  if (!session.tokenSN) return res.status(401).json({ active: false, error: 'Missing X-Token-SN header.' });
-  if (!session.vtokenSecret) return res.status(401).json({ active: false, error: 'Missing X-Vtoken-Secret header.' });
-
-  // 2. Try to decrypt vtokenSecret
+  // 1. Unseal the credential envelope — report the reason rather than a bare 401
+  let session;
   try {
-    session.decryptedSecret = decryptSecret(session.vtokenSecret);
-  } catch {
-    return res.status(401).json({ active: false, error: 'Invalid or expired vtokenSecret. Re-authenticate.' });
+    session = contextFromRequest(req, res);
+  } catch (err) {
+    return res.status(401).json({
+      active: false,
+      error: err.message,
+      code: err.code || 'invalid_credentials',
+    });
+  }
+
+  // 2. The envelope may be valid but carry no Kaspi session yet
+  if (!session.tokenSN || !session.decryptedSecret) {
+    return res.status(401).json({
+      active: false,
+      error: 'Credentials do not contain an active Kaspi session. Re-onboard this merchant.',
+      code: 'not_authenticated',
+    });
   }
 
   // 3. Ping Kaspi API to verify the token is still accepted

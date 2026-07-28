@@ -13,13 +13,17 @@
                               │
                     ┌─────────┴─────────┐
                     │   src/            │
-                    │  ├─ config.js     │  Keypair, device, constants
+                    │  ├─ envelope.js   │  Seal/unseal credentials
+                    │  ├─ device.js     │  Per-merchant device + keys
+                    │  ├─ signer.js     │  Key-bound request signing
                     │  ├─ crypto.js     │  ECDH, ECDSA, TOTP, AES
+                    │  ├─ config.js     │  Kaspi URLs, app constants
                     │  ├─ helpers.js    │  Fetch wrapper, headers
-                    │  ├─ session.js    │  Stateless session factory
+                    │  ├─ session.js    │  Session field mapping
                     │  ├─ logger.js     │  File & console logging
                     │  ├─ polling.js    │  Payment status polling
                     │  ├─ webhookStore  │  Webhook management
+                    │  ├─ middleware/   │  Credential envelope guard
                     │  └─ routes/       │  API route handlers
                     │     ├─ auth.js    │  SMS auth (3-step)
                     │     ├─ invoice.js │  Invoice creation
@@ -30,14 +34,35 @@
                     └───────────────────┘
 ```
 
-Сервер **stateless после авторизации** — данные сессии (зашифрованный `vtokenSecret`, `tokenSN`, `profileId`) хранятся на стороне клиента и передаются через заголовки.
+### Мультимерчант: сервер без состояния
+
+Сервер **не хранит данные мерчантов вообще**. При onboarding создаётся отдельное устройство (deviceId, installId, pinHash) и своя пара ключей ECDSA P-256, а всё это вместе с сессией Kaspi упаковывается в один зашифрованный **credential envelope**. Конверт отдаётся вызывающей стороне, которая хранит его у себя и присылает в заголовке `X-Kaspi-Credentials` на каждый запрос.
+
+```
+   onboarding                    любой последующий запрос
+   ──────────                    ────────────────────────
+   POST /api/auth/init           POST /api/qr/create
+     → onboardingState             X-Kaspi-Credentials: <конверт>
+   POST /api/auth/send-phone           │
+     → onboardingState                 ▼
+   POST /api/auth/verify-otp     сервер расшифровывает конверт,
+     → credentials  ────────►    подписывает запрос ключом ЭТОГО
+       (сохранить у себя)        мерчанта и забывает его
+```
+
+Почему так: Kaspi привязывает сессию к отпечатку устройства. Один общий ключ на всех означал бы, что вход второго мерчанта **вытесняет** сессию первого (`StatusCode -101001`). Отдельное устройство у каждого мерчанта снимает эту проблему.
+
+На сервере остаются только `tracked-payments.json` (незавершённые платежи, каждый со своим конвертом), `webhook-retries.json`, `webhooks.json` и `logs/`.
+
+> 🔐 Конверт — bearer-секрет: кто им владеет, тот действует от имени мерчанта. Храните как пароль, передавайте только по TLS.
 
 ### Webhooks
 
 Сервер автоматически отслеживает статусы созданных QR- и invoice-платежей (polling каждые 3 сек.) и отправляет HTTP POST-уведомления на указанные URL при изменении статуса.
 
 - 📡 **События:** `payment.success` · `payment.failed` · `payment.expired` · `payment.lost`
-- ⚙️ **Настройка:** файл `webhooks.json` (см. [`webhooks.example.json`](./webhooks.example.json))
+- ⚙️ **Настройка:** файл `webhooks.json` (см. [`webhooks.example.json`](./webhooks.example.json)) — общий для всех мерчантов
+- 🏷️ **Атрибуция:** передавайте `merchantRef` (и `orderId`) при создании платежа — они возвращаются в payload без изменений
 - 🔐 **Подпись:** HMAC SHA-256
 - 🔄 **Retry:** до 3 попыток с нарастающей задержкой
 
@@ -68,14 +93,30 @@ cp webhooks.example.json webhooks.json
 npm start
 ```
 
-При первом запуске автоматически генерируются `keypair.json` и `device.json`.
+Никакие файлы при запуске не создаются: устройства и ключи выпускаются на каждого мерчанта во время onboarding и живут только внутри конверта у клиента.
+
+### Обновление с 1.x
+
+В 1.x сессия хранилась в браузере, а устройство было общим (`keypair.json` + `device.json`). Чтобы перенести действующего мерчанта **без повторного входа по SMS** (и без риска вытеснить сессию):
+
+```bash
+# скопируйте localStorage['kaspi_session'] из браузера в session.json
+npm run mint-credentials -- --from-session ./session.json
+```
+
+Скрипт возьмёт старое устройство и ключ, соберёт из них конверт и напечатает его. Сохраните конверт в своём бэкенде, после чего `keypair.json` / `device.json` можно переименовать в `*.migrated`.
+
+> ⚠️ Заголовки `X-Token-SN` / `X-Vtoken-Secret` / `X-Profile-Id` в 2.0.0 больше не поддерживаются.
 
 ## Переменные окружения
 
 | Переменная         | Описание                                 | По умолчанию               | Обязательная |
 | ------------------ | ---------------------------------------- | -------------------------- | ------------ |
 | `TOKEN_SECRET_KEY` | 64-символьная hex-строка для AES-256-GCM | —                          | Да           |
+| `TOKEN_SECRET_KEYS`| Список ключей через запятую для ротации  | —                          | Нет          |
 | `PORT`             | Порт сервера                             | `3000`                     | Нет          |
+| `POLL_CONCURRENCY` | Сколько мерчантов опрашивать параллельно | `5`                        | Нет          |
+| `LOG_HTTP`         | Полный дамп обмена с Kaspi в stdout      | выкл.                      | Нет          |
 | `APP_VERSION`      | Версия приложения Kaspi Pay              | `4.110.1`                  | Нет          |
 | `APP_BUILD`        | Номер сборки                             | `1099`                     | Нет          |
 | `APP_PLATFORM`     | Платформа устройства                     | `iOS`                      | Нет          |
@@ -91,14 +132,19 @@ npm start
 
 > ⚠️ Параметры `APP_*` соответствуют реальному клиенту Kaspi Pay. API Kaspi валидирует эти значения и может отклонить запросы с неизвестными параметрами. Обновляйте их при выходе новой версии приложения.
 
-## Ротация ключей
+## Ротация ключа шифрования
+
+`TOKEN_SECRET_KEY` — мастер-ключ всех конвертов. Его потеря означает повторный onboarding для каждого мерчанта, поэтому меняйте его через список:
 
 ```bash
-npm run regen:keypair   # Перегенерация ECDSA-ключей
-npm run regen:device    # Перегенерация идентификатора устройства
+TOKEN_SECRET_KEYS=<новый_hex>,<старый_hex> npm start
 ```
 
-Старые файлы сохраняются как `.bak`. После ротации существующие сессии становятся недействительными.
+Первый ключ шифрует, все пробуются на расшифровке. Встретив конверт под старым ключом, сервер возвращает перевыпущенный в заголовке `X-Kaspi-Credentials-Refresh` — клиенту достаточно сохранить его вместо прежнего. Когда все конверты обновятся, старый ключ можно убрать из списка.
+
+### Смена устройства мерчанта
+
+Отдельного скрипта не нужно: вызовите `/api/auth/init` **без** заголовка `X-Kaspi-Credentials` и пройдите SMS-вход заново — будет выпущено новое устройство. Учтите, что это вытеснит текущую сессию этого мерчанта в Kaspi.
 
 ## Демо-интерфейс (`public/`)
 

@@ -15,7 +15,7 @@ Kaspi POS Automation Kaspi Pay төлемдерімен жұмыс істеу ү
   - [POST /api/auth/init](#post-apiauthinit)
   - [POST /api/auth/send-phone](#post-apiauthsend-phone)
   - [POST /api/auth/verify-otp](#post-apiauthverify-otp)
-  - [POST /api/auth/session](#post-apiauthsession)
+  - [GET /api/auth/session](#get-apiauthsession)
   - [POST /api/auth/logout](#post-apiauthlogout)
 - [Invoice — Шот-фактуралар](#invoice--шот-фактуралар)
   - [GET /api/invoice/client-info](#get-apiinvoiceclient-info)
@@ -44,17 +44,48 @@ Kaspi POS Automation Kaspi Pay төлемдерімен жұмыс істеу ү
 
 ## Аутентификация
 
-API 3 қадамды SMS-авторизацияны пайдаланады. Сәтті авторизациядан кейін клиент `tokenSN` және `vtokenSecret` алады, олар барлық қорғалған эндпоинттер үшін тақырыптарда жіберіледі.
+Сервер **саудагерлердің деректерін сақтамайды**. 3 қадамды SMS-авторизациядан кейін клиент бір шифрланған **credential envelope** — «конверт» алады. Онда саудагердің атынан жұмыс істеу үшін қажеттінің бәрі бар: құрылғы (deviceId, installId, pinHash), ECDSA P-256 жеке кілті және Kaspi сессиясы. Клиент конвертті өзінде сақтайды және әр сұраныста жібереді.
+
+Осының арқасында бір сервер **кез келген санды саудагерге** қызмет етеді: әрқайсысының өз құрылғысы мен өз қол қою кілті бар, сондықтан біреуінің кіруі екіншісінің сессиясын ығыстырмайды.
+
+Конверт мөлдір емес: ол серверлік `TOKEN_SECRET_KEY` арқылы шифрланған (AES-256-GCM), клиент жеке кілтті оқи алмайды — тек сақтап, кері қайтара алады.
 
 ### Сессия тақырыптары
 
-`/api/auth/*` және `/health` басқа барлық эндпоинттер келесі тақырыптарды талап етеді:
+`/api/auth/init`, `/api/auth/send-phone`, `/api/auth/verify-otp` және `/health` басқа барлық эндпоинттер мына тақырыпты талап етеді:
 
 | Тақырып | Түрі | Міндетті | Сипаттама |
 |---|---|---|---|
-| `X-Token-SN` | `string` | ✅ | Авторизация кезінде алынған сессия токені |
-| `X-Vtoken-Secret` | `string` | ✅ | Шифрланған сессия құпиясы |
-| `X-Profile-Id` | `string` | ❌ | Ұйым профилінің ID-сі |
+| `X-Kaspi-Credentials` | `string` | ✅ | `/api/auth/verify-otp` арқылы алынған credential envelope |
+
+> 🔐 Конверт — бұл **bearer-құпия**: кім оны иеленсе, сол саудагердің атынан әрекет етеді. Оны пароль ретінде сақтаңыз және тек TLS арқылы жіберіңіз.
+
+### Авторизация қатесіндегі жауап
+
+```json
+{
+  "error": "Envelope could not be decrypted",
+  "code": "invalid_credentials"
+}
+```
+
+| `code` | Не істеу керек |
+|---|---|
+| `missing_credentials` | Тақырып жіберілмеген |
+| `invalid_credentials` | Конверт бүлінген немесе белгісіз кілтпен шифрланған → қайта onboarding |
+| `wrong_envelope_type` | Конверттің орнына `onboardingState` жіберілген |
+| `unsupported_version` | Конверт форматы ескірген → қайта onboarding |
+| `not_authenticated` | Конверт жарамды, бірақ Kaspi сессиясы жоқ → қайта onboarding |
+
+### Шифрлау кілтін ротациялау
+
+Егер сервер `TOKEN_SECRET_KEYS=<жаңа>,<ескі>` параметрімен іске қосылса, ескі кілтпен шифрланған конверттер жұмысын жалғастырады, ал жауапта мына тақырып келеді:
+
+```
+X-Kaspi-Credentials-Refresh: <қайта шығарылған конверт>
+```
+
+Клиентке оны бұрынғысының орнына сақтау жеткілікті — тоқтап қалу болмайды.
 
 ---
 
@@ -80,14 +111,27 @@ Kaspi SMS-коды арқылы үш қадамды авторизация пр�
 
 ### `POST /api/auth/init`
 
-Авторизация процесін инициализациялау. Келесі қадамдар үшін `processId` қайтарады.
+Авторизацияны бастайды. **Жаңа құрылғы** жасайды (deviceId, installId, pinHash + ECDSA кілттер жұбы) және `onboardingState` — аяқталмаған кірудің шифрланған көшірмесін қайтарады. Сервер ештеңе есте сақтамайды: `onboardingState` келесі екі қадамға беру керек.
+
+**Тақырыптар:**
+
+| Тақырып | Міндетті | Сипаттама |
+|---|---|---|
+| `X-Kaspi-Credentials` | ❌ | **Қайта кіру** кезінде саудагердің ағымдағы конвертін жіберіңіз — сонда оның құрылғысы қайта пайдаланылады |
+
+> ⚠️ **Қайта кіру кезінде маңызды.** Kaspi сессияны құрылғыға байлайды: сол нөмірге жаңа құрылғыны тіркеу тірі сессияны **ығыстырады** (`StatusCode -101001`). Егер саудагер бұрын авторизациядан өткен болса, әрқашан бар конвертті жіберіңіз.
 
 **Сұраныс денесі:** қажет емес
 
 **Сұраныс мысалы:**
 
 ```bash
+# бастапқы onboarding
 curl -X POST http://localhost:3000/api/auth/init
+
+# қайта кіру — құрылғыны қайта пайдаланамыз
+curl -X POST http://localhost:3000/api/auth/init \
+  -H "X-Kaspi-Credentials: <конверт>"
 ```
 
 **Сәтті жауап:**
@@ -96,6 +140,8 @@ curl -X POST http://localhost:3000/api/auth/init
 {
   "success": true,
   "processId": "abc123-...",
+  "reusedDevice": false,
+  "onboardingState": "BASE64...",
   "view": "EnterPhoneNumber",
   "body": { ... }
 }
@@ -112,14 +158,14 @@ curl -X POST http://localhost:3000/api/auth/init
 | Өріс | Түрі | Міндетті | Сипаттама |
 |---|---|---|---|
 | `phoneNumber` | `string` | ✅ | Телефон нөмірі (формат: `7XXXXXXXXXX`) |
-| `processId` | `string` | ✅ | `/api/auth/init` процесінің ID-сі |
+| `onboardingState` | `string` | ✅ | `/api/auth/init` қайтарған мән |
 
 **Сұраныс мысалы:**
 
 ```bash
 curl -X POST http://localhost:3000/api/auth/send-phone \
   -H "Content-Type: application/json" \
-  -d '{"phoneNumber": "77001234567", "processId": "abc123-..."}'
+  -d '{"phoneNumber": "77001234567", "onboardingState": "BASE64..."}'
 ```
 
 **Сәтті жауап:**
@@ -152,7 +198,7 @@ SMS-кодты растау. Сәтті болған жағдайда автор
 ```bash
 curl -X POST http://localhost:3000/api/auth/verify-otp \
   -H "Content-Type: application/json" \
-  -d '{"otp": "1234", "processId": "abc123-..."}'
+  -d '{"otp": "1234", "onboardingState": "BASE64..."}'
 ```
 
 **Сәтті жауап:**
@@ -163,8 +209,9 @@ curl -X POST http://localhost:3000/api/auth/verify-otp \
   "processId": "abc123-...",
   "step": "finished",
   "message": "OTP verified and finish completed",
-  "tokenSN": "TOKEN_SN_VALUE",
-  "vtokenSecret": "ENCRYPTED_SECRET",
+  "credentials": "BASE64...",
+  "authenticated": true,
+  "deviceId": "9F3A...-...",
   "profileId": 12345,
   "organizationId": 67890,
   "orgName": "ЖК Иванов",
@@ -173,41 +220,51 @@ curl -X POST http://localhost:3000/api/auth/verify-otp \
 }
 ```
 
-> ⚠️ `tokenSN` және `vtokenSecret` сақтаңыз — олар барлық кейінгі сұраныстар үшін қажет.
+> 🔐 **`credentials` мәнін сақтаңыз** — оны өз базаңызда саудагердің жазбасымен бірге сақтаңыз, бұл жалғыз көшірме. Сервер оны сақтамайды. `tokenSN` мен vtoken құпиясы бұдан былай ашық түрде қайтарылмайды.
+
+> ⚠️ Сервер жауабында әр қадам сайын **жаңартылған** `onboardingState` келеді — Kaspi `user_token` мәнін ротациялайды. Келесі қадамда әрқашан ең соңғы мәнді пайдаланыңыз.
 
 ---
 
-### `POST /api/auth/session`
+### `GET /api/auth/session`
 
-Токеннің бар-жоғын тексеру (клиенттік тексеру).
+Конверттің мазмұнын көрсетеді. **Kaspi-ге жүгінбейді** — тек конверттің өзін тексереді; сессияның Kaspi жағында тірі екенін білу үшін [`GET /api/session/check`](#get-apisessioncheck) пайдаланыңыз.
 
-**Сұраныс денесі:**
+**Сұраныс мысалы:**
 
-| Өріс | Түрі | Міндетті | Сипаттама |
-|---|---|---|---|
-| `tokenSN` | `string` | ❌ | Сессия токені |
+```bash
+curl http://localhost:3000/api/auth/session \
+  -H "X-Kaspi-Credentials: <конверт>"
+```
 
 **Жауап:**
 
 ```json
 {
   "authenticated": true,
-  "tokenSN": "TOKEN_SN_VALUE"
+  "deviceId": "9F3A...-...",
+  "profileId": 12345,
+  "organizationId": 67890,
+  "orgName": "ЖК Иванов",
+  "phone": "77001234567",
+  "issuedAt": "2026-07-28T10:00:00.000Z"
 }
 ```
+
+> `POST /api/auth/session` 2.0.0 нұсқасында жойылды және `410 Gone` қайтарады.
 
 ---
 
 ### `POST /api/auth/logout`
 
-Сессияны аяқтау.
+Серверде сақтайтын ештеңе жоқ — конвертті өзіңізде жойсаңыз жеткілікті. Эндпоинт тек осы саудагердің аяқталмаған төлемдерін сауалнамадан алып тастайды.
 
-**Сұраныс денесі:** қажет емес
+**Тақырыптар:** `X-Kaspi-Credentials` (міндетті емес)
 
 **Жауап:**
 
 ```json
-{ "success": true }
+{ "success": true, "dropped": 2 }
 ```
 
 ---
@@ -232,9 +289,7 @@ curl -X POST http://localhost:3000/api/auth/verify-otp \
 
 ```bash
 curl "http://localhost:3000/api/invoice/client-info?phoneNumber=77001234567" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..." \
-  -H "X-Profile-Id: ..."
+  -H "X-Kaspi-Credentials: <конверт>"
 ```
 
 ---
@@ -250,15 +305,15 @@ curl "http://localhost:3000/api/invoice/client-info?phoneNumber=77001234567" \
 | `phoneNumber` | `string` | ✅ | Клиенттің телефон нөмірі |
 | `amount` | `number` | ✅ | Теңгемен сома |
 | `comment` | `string` | ❌ | Төлемге түсініктеме |
+| `merchantRef` | `string` | ❌ | Сіздің саудагер идентификаторыңыз — вебхукта өзгеріссіз қайтарылады |
+| `orderId` | `string` | ❌ | Сіздің тапсырыс идентификаторыңыз — вебхукта өзгеріссіз қайтарылады |
 
 **Сұраныс мысалы:**
 
 ```bash
 curl -X POST http://localhost:3000/api/invoice/create \
   -H "Content-Type: application/json" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..." \
-  -H "X-Profile-Id: ..." \
+  -H "X-Kaspi-Credentials: <конверт>" \
   -d '{"phoneNumber": "77001234567", "amount": 1000, "comment": "Тапсырыс #42 төлемі"}'
 ```
 
@@ -294,8 +349,7 @@ curl -X POST http://localhost:3000/api/invoice/create \
 
 ```bash
 curl "http://localhost:3000/api/invoice/details?operationId=123456" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..."
+  -H "X-Kaspi-Credentials: <конверт>"
 ```
 
 ---
@@ -315,8 +369,7 @@ curl "http://localhost:3000/api/invoice/details?operationId=123456" \
 ```bash
 curl -X POST http://localhost:3000/api/invoice/cancel \
   -H "Content-Type: application/json" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..." \
+  -H "X-Kaspi-Credentials: <конверт>" \
   -d '{"operationId": "123456"}'
 ```
 
@@ -333,8 +386,7 @@ curl -X POST http://localhost:3000/api/invoice/cancel \
 ```bash
 curl -X POST http://localhost:3000/api/invoice/history \
   -H "Content-Type: application/json" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..." \
+  -H "X-Kaspi-Credentials: <конверт>" \
   -d '{}'
 ```
 
@@ -357,15 +409,15 @@ Kaspi Pay арқылы төлем үшін QR-кодтар генерациял�
 | `amount` | `number` | ✅ | Теңгемен сома |
 | `latitude` | `number` | ❌ | Ендік (әдепкі: Алматы) |
 | `longitude` | `number` | ❌ | Бойлық (әдепкі: Алматы) |
+| `merchantRef` | `string` | ❌ | Сіздің саудагер идентификаторыңыз — вебхукта өзгеріссіз қайтарылады |
+| `orderId` | `string` | ❌ | Сіздің тапсырыс идентификаторыңыз — вебхукта өзгеріссіз қайтарылады |
 
 **Сұраныс мысалы:**
 
 ```bash
 curl -X POST http://localhost:3000/api/qr/create \
   -H "Content-Type: application/json" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..." \
-  -H "X-Profile-Id: ..." \
+  -H "X-Kaspi-Credentials: <конверт>" \
   -d '{"amount": 500}'
 ```
 
@@ -402,8 +454,7 @@ QR-төлем статусын тексеру.
 
 ```bash
 curl "http://localhost:3000/api/qr/status?qrOperationId=789012" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..."
+  -H "X-Kaspi-Credentials: <конверт>"
 ```
 
 ---
@@ -431,8 +482,7 @@ curl "http://localhost:3000/api/qr/status?qrOperationId=789012" \
 ```bash
 curl -X POST http://localhost:3000/api/history/operations \
   -H "Content-Type: application/json" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..." \
+  -H "X-Kaspi-Credentials: <конверт>" \
   -d '{"endDate": "2025-01-15"}'
 ```
 
@@ -454,8 +504,7 @@ curl -X POST http://localhost:3000/api/history/operations \
 ```bash
 curl -X POST http://localhost:3000/api/history/details \
   -H "Content-Type: application/json" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..." \
+  -H "X-Kaspi-Credentials: <конверт>" \
   -d '{"id": 123456}'
 ```
 
@@ -483,8 +532,7 @@ curl -X POST http://localhost:3000/api/history/details \
 ```bash
 curl -X POST http://localhost:3000/api/refund/create \
   -H "Content-Type: application/json" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..." \
+  -H "X-Kaspi-Credentials: <конверт>" \
   -d '{"qrOperationId": 789012, "returnAmount": 500}'
 ```
 
@@ -502,8 +550,7 @@ Kaspi API-ге сұраныс арқылы ағымдағы сессияның �
 
 ```bash
 curl "http://localhost:3000/api/session/check" \
-  -H "X-Token-SN: ..." \
-  -H "X-Vtoken-Secret: ..."
+  -H "X-Kaspi-Credentials: <конверт>"
 ```
 
 **Белсенді сессия:**
@@ -547,7 +594,9 @@ curl "http://localhost:3000/api/session/check" \
 
 ### Баптау
 
-Вебхуктар жобаның түбіріндегі `webhooks.json` файлында баптаулады. Файл объектілер массивін қамтиды:
+Вебхуктар **барлық саудагерлер үшін ортақ** — жобаның түбіріндегі `webhooks.json` файлында баптаулады. Хабарлама қай саудагерге қатысты екенін білу үшін төлем жасау кезінде `merchantRef` жіберіңіз: ол payload ішінде өзгеріссіз қайтарылады.
+
+Файл объектілер массивін қамтиды:
 
 ```json
 [
@@ -591,7 +640,7 @@ curl "http://localhost:3000/api/session/check" \
 | `payment.success` | Төлем сәтті өтті | QR: `Processed` статусы; Invoice: `Processed` статусы |
 | `payment.failed` | Төлем қабылданбады / бас тартылды | QR: `CancelledByUser`, `Rejected`, `Error` және т.б.; Invoice: `RemotePaymentCanceled`, `RemotePaymentRejected` |
 | `payment.expired` | Төлем уақыты аяқталды | QR: `QrTokenDiscarded`, `Expired`; Invoice: `Expired` |
-| `payment.lost` | Төлем статусы белгісіз — қолмен тексеру қажет | Kaspi сессиясы ығыстырылды (`SessionExpired`) немесе сұрау әрекеттері таусылды (`PollingFailed`) |
+| `payment.lost` | Төлем статусы белгісіз — қолмен тексеру қажет | Kaspi сессиясы ығыстырылды (`SessionExpired`, `data.Code = "session_evicted"` → саудагерге қайта onboarding қажет) немесе сұрау әрекеттері таусылды (`PollingFailed`) |
 
 ### Payload форматы
 
@@ -600,6 +649,10 @@ curl "http://localhost:3000/api/session/check" \
 ```json
 {
   "event": "payment.success",
+  "merchantRef": "shop-01",
+  "orderId": "ORDER-42",
+  "orgName": "ЖК Иванов",
+  "phoneNumber": "77001234567",
   "paymentId": "123456",
   "type": "qr",
   "status": "Processed",
@@ -616,6 +669,10 @@ curl "http://localhost:3000/api/session/check" \
 | Өріс | Түрі | Сипаттама |
 |---|---|---|
 | `event` | `string` | Оқиға атауы (`payment.success`, `payment.failed`, `payment.expired`, `payment.lost`) |
+| `merchantRef` | `string\|null` | Төлем жасау кезінде клиент берген саудагер идентификаторы |
+| `orderId` | `string\|null` | Төлем жасау кезінде клиент берген тапсырыс идентификаторы |
+| `orgName` | `string\|null` | Төлем жасалған сәттегі конверттен алынған ұйым атауы |
+| `phoneNumber` | `string\|null` | Төлем жасалған сәттегі конверттен алынған саудагер телефоны |
 | `paymentId` | `string` | Төлем ID-сі (QR operationId немесе invoice operationId) |
 | `type` | `string` | Төлем түрі: `qr` немесе `invoice` |
 | `status` | `string` | Kaspi API-ден финалды статус |
@@ -678,9 +735,11 @@ if (!verifySignature(rawBody, sig, 'your-webhook-secret')) {
 ## Пайдаланудың типтік сценарийі
 
 ```
-1. POST /api/auth/init              → processId алу
+1. POST /api/auth/init              → onboardingState алу (құрылғы жасалады)
 2. POST /api/auth/send-phone        → SMS жіберу
-3. POST /api/auth/verify-otp        → кодты растау → tokenSN + vtokenSecret алу
+3. POST /api/auth/verify-otp        → кодты растау → credentials алу → САҚТАУ
+
+   Әрі қарай әр сұраныс: -H "X-Kaspi-Credentials: <конверт>"
 
 4. POST /api/qr/create              → төлем үшін QR жасау
 5. GET  /api/qr/status              → төлем статусын тексеру

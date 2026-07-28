@@ -1,32 +1,12 @@
 import { Router } from 'express';
 import { KASPI_QRPAY_URL } from '../config.js';
 import { loggedFetch, signedQrPayHeaders } from '../helpers.js';
-import { decryptSecret } from '../crypto.js';
+import { requireCredentials } from '../middleware/credentials.js';
 import { trackPayment } from '../polling.js';
 
 const router = Router();
 
-// Extract session from request headers
-const extractSession = (req) => ({
-  tokenSN: req.headers['x-token-sn'] || null,
-  profileId: req.headers['x-profile-id'] || null,
-  vtokenSecret: req.headers['x-vtoken-secret'] || null,
-});
-
-const requireAuth = (req, res, next) => {
-  const session = extractSession(req);
-  if (!session.tokenSN) return res.status(401).json({ error: 'Missing X-Token-SN header.' });
-  if (!session.vtokenSecret) return res.status(401).json({ error: 'Missing X-Vtoken-Secret header.' });
-  try {
-    session.decryptedSecret = decryptSecret(session.vtokenSecret);
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired vtokenSecret. Re-authenticate.' });
-  }
-  req.session = session;
-  next();
-};
-
-router.use(requireAuth);
+router.use(requireCredentials);
 
 // ─── Client info ───
 
@@ -46,7 +26,7 @@ router.get('/client-info', async (req, res) => {
 // ─── Create invoice ───
 
 router.post('/create', async (req, res) => {
-  const { phoneNumber, amount, comment } = req.body;
+  const { phoneNumber, amount, comment, merchantRef, orderId } = req.body;
   if (!phoneNumber || !amount) return res.status(400).json({ error: 'phoneNumber and amount required' });
 
   try {
@@ -64,12 +44,12 @@ router.post('/create', async (req, res) => {
       trackPayment(
         d.QrOperationId,
         'invoice',
+        req.merchant.rawCredentials,
         {
-          tokenSN: req.session.tokenSN,
-          vtokenSecret: req.headers['x-vtoken-secret'],
-          profileId: req.session.profileId,
-        },
-        {
+          merchantRef: merchantRef || null,
+          orderId: orderId || null,
+          orgName: req.merchant.orgName || null,
+          phoneNumber: req.merchant.phoneNumber || null,
           amount: d.Amount,
           clientMobile: d.ClientMobile,
           receiptUrl: d.ReceiptUrl,

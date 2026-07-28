@@ -1,6 +1,6 @@
 {
   "name": "kaspi-pos-automation",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "description": "Автоматизация платежей для POS-систем через Kaspi Pay API",
   "main": "server.js",
@@ -27,11 +27,10 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/**/*.test.js",
+    "test": "node --test test/",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "regen:keypair": "node scripts/regen-keypair.js",
-    "regen:device": "node scripts/regen-device.js"
+    "mint-credentials": "node scripts/mint-credentials.js"
   },
   "dependencies": {
     "dotenv": "^17.3.1",
