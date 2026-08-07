@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 
 process.env.TOKEN_SECRET_KEY = 'a'.repeat(64);
 
-const { resolveEvent, buildPayload, sameRetry } = await import('../src/polling.js');
+const { resolveEvent, buildPayload, sameRetry, resolveTimeout, SCANNED_MAX_AGE_MS } =
+  await import('../src/polling.js');
 
 describe('resolveEvent — qr', () => {
   it('should return null for intermediate statuses', () => {
@@ -39,6 +40,56 @@ describe('resolveEvent — invoice', () => {
 
   it('should not treat the qr intermediate status as intermediate here', () => {
     assert.equal(resolveEvent('invoice', 'QrTokenCreated'), 'payment.failed');
+  });
+});
+
+describe('resolveTimeout', () => {
+  const NOW = 1_800_000_000_000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const qr = (over = {}) => ({
+    type: 'qr',
+    status: 'QrTokenCreated',
+    createdAt: NOW,
+    meta: { expireDate: iso(NOW + 5 * 60_000) },
+    ...over,
+  });
+
+  it('should keep polling while the QR is still within its ExpireDate', () => {
+    assert.equal(resolveTimeout(qr(), NOW + 60_000), null);
+  });
+
+  it('should expire an unscanned QR once its ExpireDate passes', () => {
+    const out = resolveTimeout(qr(), NOW + 6 * 60_000);
+    assert.equal(out.event, 'payment.expired');
+  });
+
+  it('should keep polling a scanned QR long past its ExpireDate', () => {
+    // Клиент отсканировал и держит экран оплаты. Снять его с опроса здесь —
+    // значит потерять payment.success по «случайной» поздней оплате.
+    const entry = qr({ status: 'Wait', scannedAt: NOW });
+    assert.equal(resolveTimeout(entry, NOW + 6 * 60_000), null);
+  });
+
+  it('should give up on a scanned QR after SCANNED_MAX_AGE_MS, as lost', () => {
+    const entry = qr({ status: 'Wait', scannedAt: NOW });
+    const out = resolveTimeout(entry, NOW + SCANNED_MAX_AGE_MS + 1);
+    // Именно lost, а не expired: заплатил клиент или нет — мы не знаем.
+    assert.equal(out.event, 'payment.lost');
+    assert.equal(out.data.Code, 'polling_failed');
+  });
+
+  it('should not strand a payment Kaspi gave no ExpireDate for', () => {
+    const entry = qr({ meta: {} });
+    assert.equal(resolveTimeout(entry, NOW + 60_000), null);
+    assert.equal(
+      resolveTimeout(entry, NOW + SCANNED_MAX_AGE_MS + 1).event,
+      'payment.lost',
+    );
+  });
+
+  it('should leave an already-terminal status to the normal poll path', () => {
+    const entry = qr({ status: 'Processed' });
+    assert.equal(resolveTimeout(entry, NOW + 6 * 60_000), null);
   });
 });
 
