@@ -117,8 +117,8 @@ npm run mint-credentials -- --from-session ./session.json
 | `PORT`             | Порт сервера                             | `3000`                     | Нет          |
 | `POLL_CONCURRENCY` | Сколько мерчантов опрашивать параллельно | `5`                        | Нет          |
 | `LOG_HTTP`         | Полный дамп обмена с Kaspi в stdout      | выкл.                      | Нет          |
-| `APP_VERSION`      | Версия приложения Kaspi Pay              | `4.110.1`                  | Нет          |
-| `APP_BUILD`        | Номер сборки                             | `1099`                     | Нет          |
+| `APP_VERSION`      | Версия приложения Kaspi Pay              | `26.0921`                  | Нет          |
+| `APP_BUILD`        | Номер сборки                             | `1115`                     | Нет          |
 | `APP_PLATFORM`     | Платформа устройства                     | `iOS`                      | Нет          |
 | `APP_PLATFORM_VER` | Версия ОС                                | `18.5`                     | Нет          |
 | `APP_LOCALE`       | Локаль                                   | `ru-RU`                    | Нет          |

@@ -180,6 +180,8 @@ curl -X POST http://localhost:3000/api/auth/send-phone \
 }
 ```
 
+Kaspi бас тартқанда (`success: false`) жауапта қосымша `errorCode` және `errorMessage` қайтарылады. Мысалы, `errorCode: "OldVersionToUpdate"` — қолданба нұсқасы Kaspi-дің ең төменгі нұсқасынан төмен, кіру **барлық** кассирлер үшін жұмыс істемейді: `.env` ішіндегі `APP_VERSION` / `APP_BUILD` мәндерін жаңартып, серверді қайта іске қосыңыз.
+
 ---
 
 ### `POST /api/auth/verify-otp`

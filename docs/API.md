@@ -183,6 +183,8 @@ curl -X POST http://localhost:3000/api/auth/send-phone \
 
 > ⚠️ В ответе приходит **обновлённый** `onboardingState` — Kaspi ротирует `user_token` на каждом шаге. Используйте свежее значение на следующем шаге, иначе вход не завершится.
 
+**Ответ при отказе Kaspi** (`success: false`) дополнительно содержит `errorCode` и `errorMessage` — причину отказа. Например, `errorCode: "OldVersionToUpdate"` означает, что версия приложения ниже минимальной у Kaspi и вход не работает **у всех** кассиров: обновите `APP_VERSION` / `APP_BUILD` в `.env` и перезапустите сервер.
+
 ---
 
 ### `POST /api/auth/verify-otp`
