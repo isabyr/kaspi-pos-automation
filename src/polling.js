@@ -126,6 +126,16 @@ const INVOICE_FINAL_STATUSES = {
 const QR_INTERMEDIATE = new Set(['QrTokenCreated', 'Wait']);
 const INVOICE_INTERMEDIATE = new Set(['RemotePaymentCreated']);
 
+// Промежуточные статусы, означающие, что QR уже отсканирован. Kaspi переводит
+// токен QrTokenCreated → Wait в момент сканирования.
+const SCANNED_STATUSES = new Set(['Wait']);
+
+// Предел жизни отсканированного платежа. Держим заведомо дольше, чем клиент
+// может провисеть на экране подтверждения, но не бесконечно — иначе зависшая
+// запись опрашивалась бы вечно и никогда не дошла бы до вебхука.
+export const SCANNED_MAX_AGE_MS =
+  Number(process.env.SCANNED_MAX_AGE_MS) || 10 * 60 * 1000;
+
 // ─── Track a payment ───
 
 export const trackPayment = (paymentId, type, credentials, meta = {}) => {
@@ -227,6 +237,12 @@ const sendWebhook = async (hook, payload, attempt = 1) => {
       body,
     });
     logger.info('WEBHOOK', `→ ${hook.url} | ${resp.status} ${resp.statusText}`);
+    // fetch не бросает на 4xx/5xx. Без этой проверки получатель, ответивший
+    // 500, считался бы доставленным, и событие терялось бы навсегда — а на нём
+    // держится автовозврат по опоздавшему платежу.
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    }
     // Remove from pending retries on success
     pendingRetries = pendingRetries.filter((r) => !sameRetry(r, hook, payload));
     saveRetries();
@@ -283,22 +299,65 @@ export const resolveEvent = (type, status) => {
   }
 };
 
+// ─── Снятие с опроса по времени ───
+
+/**
+ * Нужно ли снять платёж с опроса, не дождавшись финального статуса.
+ * Возвращает `null` (продолжаем опрашивать) либо `{ event, data }`.
+ *
+ * Ключевое правило: отсканированный QR по TTL не снимается. Клиент держит
+ * открытый экран оплаты и может подтвердить её сильно позже, чем Kaspi погасит
+ * токен; если удалить запись здесь, деньги уйдут, а вебхука не будет вообще —
+ * ни payment.success, ни payment.expired. Поэтому ExpireDate применяется только
+ * к неотсканированным, а отсканированные живут до SCANNED_MAX_AGE_MS.
+ */
+export const resolveTimeout = (entry, now = Date.now()) => {
+  if (entry.scannedAt) {
+    if (now - entry.scannedAt <= SCANNED_MAX_AGE_MS) return null;
+    // payment.lost, не payment.expired: мы не знаем, заплатил клиент или нет,
+    // и утверждать «не оплачено» здесь было бы враньём.
+    return {
+      event: 'payment.lost',
+      data: {
+        Status: 'ScannedUnresolved',
+        StatusDesc: 'QR отсканирован, но Kaspi так и не вернул финальный статус',
+        Code: 'polling_failed',
+      },
+    };
+  }
+
+  if (entry.meta?.expireDate) {
+    const expiry = new Date(entry.meta.expireDate).getTime();
+    if (now <= expiry || resolveEvent(entry.type, entry.status) !== null) return null;
+    return {
+      event: 'payment.expired',
+      data: { Status: 'Expired', StatusDesc: 'Время оплаты истекло' },
+    };
+  }
+
+  // Без ExpireDate ветка выше не срабатывает никогда, а retryCount обнуляется
+  // на каждом успешном ответе — такая запись опрашивалась бы вечно.
+  if (now - entry.createdAt <= SCANNED_MAX_AGE_MS) return null;
+  return {
+    event: 'payment.lost',
+    data: {
+      Status: 'PollingFailed',
+      StatusDesc: 'Kaspi не вернул ExpireDate, финальный статус не получен',
+      Code: 'polling_failed',
+    },
+  };
+};
+
 // ─── Poll cycle ───
 
 /** Опрашивает один платёж. Возвращает true, если карта изменилась. */
 const pollEntry = async (id, entry) => {
-  // TTL check via expireDate
-  if (entry.meta?.expireDate) {
-    const expiry = new Date(entry.meta.expireDate).getTime();
-    if (Date.now() > expiry && resolveEvent(entry.type, entry.status) === null) {
-      logger.info('POLLING', `Payment ${id} expired (TTL)`);
-      sendWebhooks(
-        'payment.expired',
-        buildPayload('payment.expired', entry, { Status: 'Expired', StatusDesc: 'Время оплаты истекло' }),
-      );
-      trackedPayments.delete(id);
-      return true;
-    }
+  const timedOut = resolveTimeout(entry);
+  if (timedOut) {
+    logger.info('POLLING', `Payment ${id} — ${timedOut.event} (${timedOut.data.Status})`);
+    sendWebhooks(timedOut.event, buildPayload(timedOut.event, entry, timedOut.data));
+    trackedPayments.delete(id);
+    return true;
   }
 
   const result = await fetchStatus(entry);
@@ -364,6 +423,13 @@ const pollEntry = async (id, entry) => {
 
   logger.info('POLLING', `Payment ${id}: ${entry.status} → ${newStatus}`);
   entry.status = newStatus;
+
+  // `Wait` — единственный сигнал Kaspi о том, что QR отсканирован и клиент
+  // сейчас держит экран оплаты. С этого момента запись живёт по своему таймеру
+  // (см. начало pollEntry), а не по ExpireDate.
+  if (!entry.scannedAt && SCANNED_STATUSES.has(newStatus)) {
+    entry.scannedAt = Date.now();
+  }
 
   const event = resolveEvent(entry.type, newStatus);
   if (event) {
