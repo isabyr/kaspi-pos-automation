@@ -219,6 +219,19 @@ const showMainScreen = (data) => {
   }
 };
 
+const copyEnvelope = async () => {
+  const { credentials } = getSession();
+  if (!credentials) return;
+  const btn = $('btnCopyEnvelope');
+  try {
+    await navigator.clipboard.writeText(credentials);
+    btn.textContent = 'Скопировано ✓';
+  } catch {
+    btn.textContent = 'Ошибка копирования';
+  }
+  setTimeout(() => (btn.textContent = 'Копировать конверт'), 1500);
+};
+
 const logout = async () => {
   const { credentials } = getSession();
   clearSession();
@@ -710,6 +723,7 @@ Object.assign(window, {
   sendPhone,
   verifyOtp,
   resetAuth,
+  copyEnvelope,
   logout,
   switchTab,
   createInvoice,
