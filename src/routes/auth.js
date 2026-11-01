@@ -13,7 +13,7 @@ import { buildDevice } from '../device.js';
 import { createSigner } from '../signer.js';
 import { sealCredentials, sealOnboarding, unsealOnboarding } from '../envelope.js';
 import { contextFromRequest } from '../middleware/credentials.js';
-import { loggedFetch, extractUserToken, entranceCookie, generateUUID, nowISO } from '../helpers.js';
+import { loggedFetch, extractUserToken, entranceCookie, generateUUID, nowISO, normalizePhone } from '../helpers.js';
 import { dropPaymentsFor } from '../polling.js';
 
 const router = Router();
@@ -131,8 +131,13 @@ router.post('/init', async (req, res) => {
 // ═══════════════════════════════════════════════════
 
 router.post('/send-phone', async (req, res) => {
-  const { phoneNumber } = req.body;
-  if (!phoneNumber) return res.status(400).json({ error: 'phoneNumber required (e.g. 7XXXXXXXXX)' });
+  if (!req.body.phoneNumber) {
+    return res.status(400).json({ error: 'phoneNumber required: 10 digits without country code (e.g. 7001234567)' });
+  }
+  const phoneNumber = normalizePhone(req.body.phoneNumber);
+  if (phoneNumber.length !== 10) {
+    return res.status(400).json({ error: 'phoneNumber must be 10 digits without country code (e.g. 7001234567)' });
+  }
 
   const state = readOnboarding(req, res);
   if (!state) return;

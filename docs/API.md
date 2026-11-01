@@ -157,7 +157,7 @@ curl -X POST http://localhost:3000/api/auth/init \
 
 | Поле | Тип | Обязательный | Описание |
 |---|---|---|---|
-| `phoneNumber` | `string` | ✅ | Номер телефона (формат: `7XXXXXXXXXX`) |
+| `phoneNumber` | `string` | ✅ | Номер телефона кассира: 10 цифр без кода страны, например `7001234567` |
 | `onboardingState` | `string` | ✅ | Значение из `/api/auth/init` |
 
 **Пример запроса:**
@@ -165,8 +165,10 @@ curl -X POST http://localhost:3000/api/auth/init \
 ```bash
 curl -X POST http://localhost:3000/api/auth/send-phone \
   -H "Content-Type: application/json" \
-  -d '{"phoneNumber": "77001234567", "onboardingState": "BASE64..."}'
+  -d '{"phoneNumber": "7001234567", "onboardingState": "BASE64..."}'
 ```
+
+> ⚠️ **Важно:** Номер указывается без кода страны. Номер с кодом страны (`+7` или `8`) приводится к 10-значному виду автоматически.
 
 **Успешный ответ:**
 
@@ -220,7 +222,7 @@ curl -X POST http://localhost:3000/api/auth/verify-otp \
   "profileId": 12345,
   "organizationId": 67890,
   "orgName": "ИП Иванов",
-  "phone": "77001234567",
+  "phone": "7001234567",
   "organizations": [ ... ]
 }
 ```
@@ -249,7 +251,7 @@ curl http://localhost:3000/api/auth/session \
   "profileId": 12345,
   "organizationId": 67890,
   "orgName": "ИП Иванов",
-  "phone": "77001234567",
+  "phone": "7001234567",
   "issuedAt": "2026-07-28T10:00:00.000Z"
 }
 ```
@@ -585,7 +587,7 @@ curl "http://localhost:3000/api/session/check" \
 
 | HTTP-код | Описание |
 |---|---|
-| `400` | Отсутствуют обязательные параметры |
+| `400` | Отсутствуют обязательные параметры или параметр имеет неверный формат |
 | `401` | Отсутствуют или невалидные заголовки сессии |
 | `500` | Внутренняя ошибка сервера или ошибка Kaspi API |
 
@@ -655,7 +657,7 @@ curl "http://localhost:3000/api/session/check" \
   "merchantRef": "shop-01",
   "orderId": "ORDER-42",
   "orgName": "ИП Иванов",
-  "phoneNumber": "77001234567",
+  "phoneNumber": "7001234567",
   "paymentId": "123456",
   "type": "qr",
   "status": "Processed",
